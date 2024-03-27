@@ -1,0 +1,144 @@
+import os
+import json
+import requests
+from langchain.chains.question_answering import load_qa_chain
+from langchain.tools import BaseTool
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from typing import List
+from langchain.chat_models import ChatOpenAI
+from langchain.agents import initialize_agent
+from langchain.chains.conversation.memory import ConversationBufferWindowMemory
+
+
+# Set the OpenAI API key
+os.environ["OPENAI_API_KEY"] = "enter your own api key here "
+
+# Load PDF document
+pdf_path = "/content/handbook.pdf"
+loader = PyPDFLoader(pdf_path)
+documents = loader.load()
+
+# Split document into chunks
+text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+doc_chunks = text_splitter.split_documents(documents)
+
+# Convert chunks into embeddings
+embeddings = HuggingFaceEmbeddings()
+
+# Create vector store
+db = FAISS.from_documents(doc_chunks, embeddings)
+
+model_name = "gpt-3.5-turbo-0125"
+llm = ChatOpenAI(model_name=model_name)
+chain = load_qa_chain(llm, chain_type="stuff")
+
+
+class PDFQueryTool(BaseTool):
+    name = "PDF Query Tool"
+    description = ("this Tool is for querying a PDF document with a set of questions and then it returns a JSON object""this tool must only be used for getting anser to questions from pdf")
+    is_single_input_pdf_query_tool = True  # Alternative attribute name
+
+    def _run(self, input_data: str) -> dict:
+        # Extract questions from the input data string
+        input_data = input_data.removeprefix("Answer the questions from context given:")
+        questions = input_data.split(",")
+
+        # Query each question and retrieve relevant documents
+        results = {}
+        for question in questions:
+            # Query vector store
+            query_results = db.similarity_search(question.strip())
+
+             # Remove leading/trailing whitespace
+            response=chain.run(input_documents=query_results, question=question)
+            results[question] = response
+
+        # Construct JSON-like string
+        json_results = "{\n"
+        for question, answer in results.items():
+            json_results += f'    "{question.strip()}": "{answer}",\n'
+        json_results = json_results.rstrip(",\n")  # Remove trailing comma and newline
+        json_results += "\n}"
+
+        return json_results
+
+
+
+class Slack_Post_tool(BaseTool):
+    name = "Slack message Post Tool"
+    description = ("this tool can be used for posting text on slack channel,use this tool whenever you need to post some text or results on to a slack channel.this tool takes a dictionary as input, converts it into a JSON-formatted string, and sends it to Slack as a message.")
+    is_single_input_Slack_Post_tool = True
+
+    def _run(self, input_data: str) -> str:
+        """Posts results to Slack."""
+        # Format the input data into a message
+        message = input_data
+
+        # Set your Slack API token
+        slack_token = 'enter your own slack api token here'
+
+        # Set the channel ID where you want to send the message
+        channel_id = 'Replace 'YOUR_CHANNEL_ID' with the actual channel ID '  
+
+        # Slack API endpoint for posting messages
+        slack_url = "Replace here Slack API endpoint for posting messages "
+
+        # HTTP headers for authorization and content type
+        headers = {
+            "Authorization": f"Bearer {slack_token}",
+            "Content-Type": "application/json"
+        }
+
+        # Payload for the Slack message
+        payload = {
+            "channel": channel_id,
+            "text": message
+        }
+
+        # Send the message to Slack
+        response = requests.post(slack_url, headers=headers, json=payload)
+
+        # Check if the message was successfully posted
+        if response.status_code == 200:
+            return "Results posted to Slack successfully!"
+        else:
+            return "Failed to post results to Slack."
+
+   
+
+# Initialize the PDF Query Tool and Slack Post Tool
+pdf_query_tool = PDFQueryTool()
+Slack_posttool = Slack_Post_tool()
+
+# Define the list of tools
+tools = (pdf_query_tool, Slack_posttool)
+
+conversational_memory = ConversationBufferWindowMemory(
+        memory_key='chat_history',
+        k=5,
+        return_messages=True
+)
+
+llm = ChatOpenAI(
+        openai_api_key="enter your own api key here ",
+        temperature=0,
+        model_name='gpt-3.5-turbo-0125'
+)
+# Initialize agent with tools
+agent = initialize_agent(
+    agent='zero-shot-react-description',  # Choose the appropriate agent name
+    tools=tools,
+    llm=llm,  # Your initialized language model (LLM)
+    verbose=True,
+    max_iterations=3,
+    early_stopping_method='generate',
+    memory=conversational_memory  # Your conversational memory, if needed
+)
+
+# Execute the agent with the query
+agent.run("Retrieve answers to questions from PDF after this send these answers as message on slack channel: \"What is the name of the company?\", \"Who is the CEO of the company?\", \"What is their vacation policy?\", and \"What is the termination policy?\"")
+
+
